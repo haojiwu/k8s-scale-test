@@ -8,8 +8,9 @@
 # This is sufficient to stress the kube-proxy sync path.
 #
 # Usage:
-#   ./k8s-scale-test.sh load    N_SERVICES [ENDPOINTS_PER_SVC]
-#   ./k8s-scale-test.sh addsvc  N_MORE     [ENDPOINTS_PER_SVC]
+#   ./k8s-scale-test.sh load    N_SERVICES [ENDPOINTS_PER_SVC] [PORTS_PER_SVC]
+#   ./k8s-scale-test.sh addsvc  N_MORE     [ENDPOINTS_PER_SVC] [PORTS_PER_SVC]
+#   ./k8s-scale-test.sh range   START END  [ENDPOINTS_PER_SVC] [PORTS_PER_SVC]
 #   ./k8s-scale-test.sh trim    TARGET_N
 #   ./k8s-scale-test.sh delsvc  N_TO_DELETE
 #   ./k8s-scale-test.sh churn   [INTERVAL_SECONDS] [BATCH_SIZE]
@@ -32,7 +33,7 @@ KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
 # Use an array so the multi-word command splits correctly on invocation.
 KUBECTL=("$KUBECTL_BIN" "--context=$KUBE_CONTEXT")
 
-usage() { sed -n '2,22p' "$0"; exit 1; }
+usage() { sed -n '2,23p' "$0"; exit 1; }
 
 # Deterministic synthetic endpoint IP from a service index + endpoint index.
 # Uses 10.244.0.0/14 (CIDR with ~262k addresses) which is the common pod-network
@@ -49,7 +50,7 @@ ep_ip() {
 
 # Generate one Service + one EndpointSlice as YAML to stdout.
 gen_one() {
-    local i="$1" eps="$2"
+    local i="$1" eps="$2" ports="${3:-1}"
     cat <<EOF
 ---
 apiVersion: v1
@@ -66,6 +67,9 @@ spec:
     protocol: TCP
     targetPort: 8080
     name: http
+$(for ((k=1; k<ports; k++)); do
+    printf '  - port: %d\n    protocol: TCP\n    targetPort: %d\n    name: p%d\n' $((8000 + k)) $((9000 + k)) "$k"
+done)
 ---
 apiVersion: discovery.k8s.io/v1
 kind: EndpointSlice
@@ -80,6 +84,9 @@ ports:
 - name: http
   port: 8080
   protocol: TCP
+$(for ((k=1; k<ports; k++)); do
+    printf -- '- name: p%d\n  port: %d\n  protocol: TCP\n' "$k" $((9000 + k))
+done)
 endpoints:
 EOF
     for ((j=0; j<eps; j++)); do
@@ -99,19 +106,19 @@ ensure_namespace() {
 
 # Apply YAML in chunks of BATCH services to keep request bodies manageable.
 apply_range() {
-    local start="$1" end="$2" eps="$3"
+    local start="$1" end="$2" eps="$3" ports="${4:-1}"
     local total=$(( end - start + 1 ))
     local applied=0
     local t_start
     t_start=$(date +%s)
 
     local tmpfile
-    tmpfile=$(mktemp /tmp/k8s-scale-XXXXXX.yaml)
+    tmpfile=$(mktemp /tmp/k8s-scale-XXXXXX)
     trap "rm -f $tmpfile" RETURN
 
     local i
     for ((i=start; i<=end; i++)); do
-        gen_one "$i" "$eps" >> "$tmpfile"
+        gen_one "$i" "$eps" "$ports" >> "$tmpfile"
         if (( (i - start + 1) % BATCH == 0 || i == end )); then
             "${KUBECTL[@]}" apply -f "$tmpfile" --server-side --force-conflicts >/dev/null
             applied=$(( i - start + 1 ))
@@ -137,16 +144,18 @@ current_max_index() {
 cmd_load() {
     local n="${1:?N_SERVICES required}"
     local eps="${2:-1}"
-    echo "[load] Wipe namespace and create $n services x $eps endpoints each." >&2
+    local ports="${3:-1}"
+    echo "[load] Wipe namespace and create $n services x $eps endpoints x $ports ports each." >&2
     "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=true >/dev/null 2>&1 || true
     ensure_namespace
-    apply_range 0 $((n - 1)) "$eps"
+    apply_range 0 $((n - 1)) "$eps" "$ports"
     echo "[load] done." >&2
 }
 
 cmd_addsvc() {
     local n_more="${1:?N_MORE required}"
     local eps="${2:-1}"
+    local ports="${3:-1}"
     ensure_namespace
     local start
     start=$(current_max_index)
@@ -156,8 +165,8 @@ cmd_addsvc() {
         start=$((start + 1))
     fi
     local end=$((start + n_more - 1))
-    echo "[addsvc] Adding services ${start}..${end} (${n_more} services x ${eps} endpoints each)." >&2
-    apply_range "$start" "$end" "$eps"
+    echo "[addsvc] Adding services ${start}..${end} (${n_more} services x ${eps} endpoints x ${ports} ports each)." >&2
+    apply_range "$start" "$end" "$eps" "$ports"
 }
 
 # Delete services svc-${start}..svc-${end} (and their EndpointSlices) in
@@ -259,6 +268,16 @@ cmd_delsvc() {
     local start=$(( cur_max - n_actual + 1 ))
     echo "[delsvc] Deleting svc-${start}..svc-${cur_max} (${n_actual} services)." >&2
     delete_range "$start" "$cur_max"
+}
+
+# Apply an explicit index range. Unlike addsvc this takes no lock on
+# current_max_index, so disjoint ranges can run concurrently. Server-side apply
+# makes re-running a range idempotent.
+cmd_range() {
+    local start="${1:?START required}" end="${2:?END required}" eps="${3:-1}" ports="${4:-1}"
+    ensure_namespace
+    echo "[range] Applying svc-${start}..svc-${end} (${eps} endpoints, ${ports} ports each)." >&2
+    apply_range "$start" "$end" "$eps" "$ports"
 }
 
 cmd_stat() {
@@ -468,6 +487,7 @@ cmd_cleanup() {
 case "${1:-}" in
     load)    shift; cmd_load    "$@" ;;
     addsvc)  shift; cmd_addsvc  "$@" ;;
+    range)   shift; cmd_range   "$@" ;;
     trim)    shift; cmd_trim    "$@" ;;
     delsvc)  shift; cmd_delsvc  "$@" ;;
     churn)   shift; cmd_churn   "$@" ;;
